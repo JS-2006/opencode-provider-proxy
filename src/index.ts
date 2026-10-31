@@ -35,8 +35,14 @@ export default Plugin.define({
       ReturnType<typeof ctx.rpc.register<typeof ProviderProxy>>
     > | undefined
 
-    async function startGateway(): Promise<Running> {
-      const normalized = normalizeOptions(ctx.options)
+    /**
+     * Build a fresh gateway from `options`, re-apply routes, then atomically
+     * swap it in as `current` and close the superseded gateway (exactly once).
+     * On any failure the previously-live gateway is left untouched and the
+     * error propagates to the caller.
+     */
+    async function doRebuild(options: unknown): Promise<Running> {
+      const normalized = normalizeOptions(options)
       const providers = providerList(await ctx.provider.list())
       const routes = buildRoutes(normalized, providers)
 
@@ -53,13 +59,34 @@ export default Plugin.define({
         },
       })
 
-      await applyRoutes(ctx, gateway.port, routes)
-      const running: Running = { gateway, normalized }
-      current = running
-      return running
+      try {
+        await applyRoutes(ctx, gateway.port, routes)
+      } catch (err) {
+        // Never leak a half-configured gateway; the previous one stays live.
+        await gateway.close()
+        throw err
+      }
+
+      const next: Running = { gateway, normalized }
+      const previous = current
+      current = next
+      if (previous) await previous.gateway.close()
+      return next
     }
 
-    await startGateway()
+    // Serialize every rebuild through a promise chain so event-driven and RPC
+    // rebuilds queue instead of interleaving. A failed rebuild does not poison
+    // the chain; subsequent rebuilds still run.
+    let rebuildQueue: Promise<unknown> = Promise.resolve()
+    function rebuild(options: unknown = ctx.options): Promise<Running> {
+      const run = rebuildQueue.then(() => doRebuild(options))
+      rebuildQueue = run.catch(() => {
+        /* swallow to keep the queue alive; the error is delivered to the caller */
+      })
+      return run
+    }
+
+    await rebuild()
 
     registration = await ctx.rpc.register(ProviderProxy, {
       async getSettings() {
@@ -73,19 +100,25 @@ export default Plugin.define({
         const { providers } = input as { providers: Record<string, string | null> }
         const running = current as Running
 
+        // `optionsFromUpdate` encodes providers as `{ proxy: name }` objects
+        // (the jsonc persistence shape), but `normalizeOptions` consumes a plain
+        // `provider -> name` string map. Bridge the two shapes here so the
+        // same object can be persisted and rebuilt.
         const newOptions = optionsFromUpdate(running.normalized, { providers })
+        const providersTable: Record<string, string> = {}
+        for (const [providerId, target] of Object.entries(newOptions.providers)) {
+          providersTable[providerId] = target.proxy
+        }
+        const nextOptions = { proxies: newOptions.proxies, providers: providersTable }
+
         const configFile = await findPluginConfigFile(ctx.location.directory)
         if (!configFile) throw new Error("no plugin config file found")
-        await updatePluginOptions(configFile, newOptions)
+        await updatePluginOptions(configFile, nextOptions)
 
-        // Re-apply routes for the new options against the running gateway so the
-        // change takes effect immediately (the config.updated subscription also
-        // rebuilds the gateway; either path converges on the new settings).
-        const nextNormalized = normalizeOptions(newOptions)
-        const nextProviders = providerList(await ctx.provider.list())
-        const nextRoutes = buildRoutes(nextNormalized, nextProviders)
-        await applyRoutes(ctx, running.gateway.port, nextRoutes)
-        current = { gateway: running.gateway, normalized: nextNormalized }
+        // Rebuild through the same serialized path as config.updated. This
+        // rebuilds the gateway from fresh state and rewrites provider routes;
+        // on failure the previous gateway stays alive and the error propagates.
+        await rebuild(nextOptions)
 
         await registration?.events.emit("updated", { providers })
         return { ok: true }
@@ -98,12 +131,7 @@ export default Plugin.define({
         for await (const _event of subscription) {
           if (abort.signal.aborted) break
           try {
-            // Build the new gateway first; only on success swap it in and
-            // close the old one. If the rebuild fails, keep the old gateway
-            // running so the proxy is not left dead.
-            const previous = current as Running
-            current = await startGateway()
-            await previous.gateway.close()
+            await rebuild()
           } catch (err) {
             console.error("provider-proxy: rebuild failed, keeping existing gateway active", err)
           }
