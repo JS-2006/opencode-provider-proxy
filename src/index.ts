@@ -3,7 +3,7 @@ import { normalizeOptions, type NormalizedOptions } from "./config.js"
 import { createGateway } from "./gateway.js"
 import { applyRoutes, buildRoutes } from "./apply.js"
 import { buildUpstreamUrl } from "./upstream.js"
-import { findPluginConfigFile, updatePluginOptions } from "./jsonc-config.js"
+import { findPluginConfigFile, readPluginOptions, updatePluginOptions } from "./jsonc-config.js"
 import { ProviderProxy, getSettingsPayload, optionsFromUpdate } from "./rpc.js"
 
 interface ProviderRef {
@@ -28,6 +28,7 @@ export default Plugin.define({
     interface Running {
       gateway: { port: number; close: () => Promise<void> }
       normalized: NormalizedOptions
+      routes: ReturnType<typeof buildRoutes>
     }
 
     let current: Running | undefined
@@ -35,16 +36,60 @@ export default Plugin.define({
       ReturnType<typeof ctx.rpc.register<typeof ProviderProxy>>
     > | undefined
 
+    function sameNormalized(a: NormalizedOptions, b: NormalizedOptions): boolean {
+      const mapsEqual = (
+        x: ReadonlyMap<string, unknown>,
+        y: ReadonlyMap<string, unknown>,
+      ): boolean => {
+        if (x.size !== y.size) return false
+        for (const [key, value] of x) {
+          if (!y.has(key)) return false
+          if (JSON.stringify(value) !== JSON.stringify(y.get(key))) return false
+        }
+        return true
+      }
+      return mapsEqual(a.proxies, b.proxies) && mapsEqual(a.providers, b.providers)
+    }
+
+    function sameRoutes(
+      a: ReturnType<typeof buildRoutes>,
+      b: ReturnType<typeof buildRoutes>,
+    ): boolean {
+      if (a.size !== b.size) return false
+      for (const [providerId, spec] of a) {
+        if (!b.has(providerId)) return false
+        if (JSON.stringify(spec) !== JSON.stringify(b.get(providerId))) return false
+      }
+      return true
+    }
+
     /**
      * Build a fresh gateway from `options`, re-apply routes, then atomically
      * swap it in as `current` and close the superseded gateway (exactly once).
      * On any failure the previously-live gateway is left untouched and the
      * error propagates to the caller.
+     *
+     * The rebuild is idempotent: if the normalized options and the computed
+     * routes already match the currently-applied gateway, it returns that
+     * gateway without creating a new one. This keeps a redundant
+     * `config.updated` rebuild (e.g. one that fires after an RPC update already
+     * applied the same state) from reverting the change or spinning up a
+     * duplicate gateway, while still reacting to provider-list/baseURL changes.
      */
     async function doRebuild(options: unknown): Promise<Running> {
+      if (abort.signal.aborted) {
+        throw new Error("provider-proxy: shutdown in progress")
+      }
       const normalized = normalizeOptions(options)
       const providers = providerList(await ctx.provider.list())
       const routes = buildRoutes(normalized, providers)
+      if (
+        current &&
+        sameNormalized(normalized, current.normalized) &&
+        sameRoutes(routes, current.routes)
+      ) {
+        return current
+      }
 
       const gateway = await createGateway({
         resolveUpstream: (providerID, reqPath) => {
@@ -60,6 +105,9 @@ export default Plugin.define({
       })
 
       try {
+        if (abort.signal.aborted) {
+          throw new Error("provider-proxy: shutdown in progress")
+        }
         await applyRoutes(ctx, gateway.port, routes)
       } catch (err) {
         // Never leak a half-configured gateway; the previous one stays live.
@@ -67,7 +115,7 @@ export default Plugin.define({
         throw err
       }
 
-      const next: Running = { gateway, normalized }
+      const next: Running = { gateway, normalized, routes }
       const previous = current
       current = next
       if (previous) await previous.gateway.close()
@@ -126,12 +174,20 @@ export default Plugin.define({
     })
 
     const subscription = ctx.event.subscribe({ types: ["config.updated"] })
+    const subIter = subscription[Symbol.asyncIterator]() as AsyncIterableIterator<unknown>
+
     void (async () => {
       try {
-        for await (const _event of subscription) {
+        for await (const _event of subIter) {
           if (abort.signal.aborted) break
           try {
-            await rebuild()
+            // Rebuild from the freshly-read config file rather than the
+            // in-memory `ctx.options` snapshot, which may be stale relative to
+            // a just-applied RPC update. Combined with the idempotent rebuild
+            // in `doRebuild`, a redundant watcher event after an RPC update is
+            // a no-op instead of a revert.
+            const fresh = await readPluginOptions(ctx.location.directory)
+            await rebuild(fresh ?? ctx.options)
           } catch (err) {
             console.error("provider-proxy: rebuild failed, keeping existing gateway active", err)
           }
@@ -142,8 +198,20 @@ export default Plugin.define({
     })()
 
     return async () => {
+      // Signal shutdown first: rebuilds started after this point become no-ops.
       abort.abort()
-      await (current as Running).gateway.close()
+      // Stop the config-subscription consumer loop.
+      if (typeof (subIter as { return?: unknown }).return === "function") {
+        try {
+          await (subIter as { return: () => Promise<unknown> }).return()
+        } catch {
+          /* best effort */
+        }
+      }
+      // Await any queued/in-flight rebuild so it settles before we resolve; the
+      // abort flag makes skipped/pending work exit without creating a gateway.
+      await rebuildQueue.catch(() => {})
+      if (current) await current.gateway.close()
     }
   },
 })

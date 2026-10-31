@@ -205,11 +205,13 @@ describe("createGateway", () => {
   })
 
   it("streams the response body chunk-by-chunk before upstream closes", async () => {
+    let upstreamEnded = false
     const upstream = await createUpstream((_req, res) => {
       res.writeHead(200, { "content-type": "text/plain" })
       res.write("chunk-1")
       setTimeout(() => {
         res.write("chunk-2")
+        upstreamEnded = true
         res.end()
       }, 100)
     })
@@ -220,18 +222,20 @@ describe("createGateway", () => {
     })
     try {
       await new Promise<void>((resolve, reject) => {
-        const start = Date.now()
         const chunks: string[] = []
-        let firstTime = -1
+        let firstDataBeforeUpstreamEnd = true
         const req = http.get(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`, (res) => {
           res.on("data", (c) => {
-            if (firstTime < 0) firstTime = Date.now() - start
+            if (chunks.length === 0) {
+              // Causality: the first chunk must arrive before the upstream ends.
+              firstDataBeforeUpstreamEnd = !upstreamEnded
+            }
             chunks.push(c.toString())
           })
           res.on("end", () => {
             try {
-              expect(firstTime).toBeGreaterThanOrEqual(0)
-              expect(firstTime).toBeLessThanOrEqual(60)
+              expect(firstDataBeforeUpstreamEnd).toBe(true)
+              expect(chunks.length).toBeGreaterThanOrEqual(2)
               expect(chunks.join("")).toBe("chunk-1chunk-2")
               resolve()
             } catch (e) {

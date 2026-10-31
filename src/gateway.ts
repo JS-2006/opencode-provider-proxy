@@ -117,10 +117,14 @@ export async function createGateway(cfg: GatewayConfig): Promise<Gateway> {
     let agent: Agent | undefined
     const proxyTarget = cfg.getProxy(providerID)
     if (proxyTarget) {
-      let cached = agents.get(providerID)
+      // Key the agent cache by the full proxy identity (URL plus credentials)
+      // so two providers sharing the same proxy reuse one agent, while agents
+      // for different targets are never reused.
+      const cacheKey = `${proxyTarget.url}#${proxyTarget.username ?? ""}#${proxyTarget.password ?? ""}`
+      let cached = agents.get(cacheKey)
       if (!cached) {
         cached = buildAgent(proxyTarget)
-        agents.set(providerID, cached)
+        agents.set(cacheKey, cached)
       }
       agent = cached
     }

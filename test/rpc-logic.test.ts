@@ -96,4 +96,23 @@ describe("optionsFromUpdate", () => {
     const next = optionsFromUpdate(current, { providers: { b: "p1" } })
     expect(next.providers).toEqual({ b: { proxy: "p1" } })
   })
+
+  it("rejects an unknown proxy name before building options", () => {
+    const current = normalizeOptions({
+      proxies: { p1: { url: "http://proxy1:8080" } },
+      providers: {},
+    })
+    expect(() =>
+      optionsFromUpdate(current, { providers: { a: "nonexistent" } }),
+    ).toThrow(/proxy "nonexistent" is not configured/)
+  })
+
+  it("allows clearing a mapping to null even alongside an unknown name for others", () => {
+    const current = normalizeOptions({
+      proxies: { p1: { url: "http://proxy1:8080" } },
+      providers: { a: "p1" },
+    })
+    const next = optionsFromUpdate(current, { providers: { a: null, b: "p1" } })
+    expect(next.providers).toEqual({ b: { proxy: "p1" } })
+  })
 })

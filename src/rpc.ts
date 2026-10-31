@@ -85,6 +85,11 @@ export function optionsFromUpdate(
   const providers: Record<string, { proxy: string }> = {}
   for (const [providerId, proxyName] of Object.entries(update.providers)) {
     if (proxyName === null) continue
+    // Reject any proxy name that is not configured before the caller persists
+    // the mapping, so a bad RPC payload can never corrupt the on-disk config.
+    if (!current.proxies.has(proxyName)) {
+      throw new Error(`proxy "${proxyName}" is not configured`)
+    }
     providers[providerId] = { proxy: proxyName }
   }
 

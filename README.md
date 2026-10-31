@@ -31,7 +31,7 @@ directory into your project's `.opencode/plugins/` directory. Plugins under
 `.opencode/plugins/` are discovered automatically:
 
 ```text
-<project>/opencode/
+<project>/.opencode/
   plugins/
     provider-proxy/   <- this repo (or a symlink to it)
 ```

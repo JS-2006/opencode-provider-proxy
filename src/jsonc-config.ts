@@ -60,6 +60,54 @@ export async function updatePluginOptions(
   await atomicWrite(file, updated)
 }
 
+/**
+ * Read the current `options` of this plugin's entry from the config file
+ * closest to `startDir`, or return `undefined` when no such entry exists. This
+ * is the authoritative, freshly-read state (used by `config.updated` rebuilds
+ * so they never act on a stale in-memory options snapshot).
+ */
+export async function readPluginOptions(
+  startDir: string,
+): Promise<unknown | undefined> {
+  const file = await findPluginConfigFile(startDir)
+  if (!file) return undefined
+  const text = await fs.readFile(file, "utf8")
+  return extractPluginOptions(parse(text))
+}
+
+function extractPluginOptions(doc: unknown): unknown | undefined {
+  if (
+    typeof doc !== "object" ||
+    doc === null ||
+    Array.isArray(doc)
+  ) {
+    return undefined
+  }
+  const plugins = (doc as Record<string, unknown>).plugins
+  if (!Array.isArray(plugins)) return undefined
+  for (const entry of plugins) {
+    if (
+      typeof entry === "object" &&
+      entry !== null &&
+      !Array.isArray(entry)
+    ) {
+      const pkg = (entry as Record<string, unknown>).package
+      if (
+        typeof pkg === "string" &&
+        (PLUGIN_NAMES.includes(pkg) ||
+          PLUGIN_NAMES.includes(path.basename(pkg)))
+      ) {
+        const opts = (entry as Record<string, unknown>).options
+        if (typeof opts === "object" && opts !== null && !Array.isArray(opts)) {
+          return opts
+        }
+        return undefined
+      }
+    }
+  }
+  return undefined
+}
+
 function editConfigText(text: string, options: unknown): string {
   const tree = parseTree(text)
   if (!tree) throw new Error("Could not parse JSONC config")

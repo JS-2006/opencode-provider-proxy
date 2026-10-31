@@ -15,6 +15,8 @@ interface FakeGateway {
   close: () => Promise<void>
 }
 
+const tick = () => new Promise<void>((r) => setTimeout(r, 20))
+
 // Shared mutable state visible to the hoisted vi.mock factory.
 const state = vi.hoisted(() => ({
   gateways: [] as FakeGateway[],
@@ -53,11 +55,37 @@ interface Handlers {
   }>
 }
 
+// A pushable async iterator so tests can drive the `config.updated` subscription.
+function makeSubscription() {
+  const pending: unknown[] = []
+  const waiters: Array<() => void> = []
+  return {
+    push(ev: unknown) {
+      pending.push(ev)
+      waiters.shift()?.()
+    },
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => {
+          for (;;) {
+            if (pending.length > 0) {
+              return { value: pending.shift(), done: false }
+            }
+            await new Promise<void>((r) => waiters.push(r))
+          }
+        },
+        return: async () => ({ value: undefined, done: true }),
+      }
+    },
+  }
+}
+
 async function boot(options: unknown, providers: ProviderShape[]) {
   state.gateways.length = 0
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "proxy-lifecycle-"))
+  const configPath = path.join(dir, "opencode.json")
   await fs.writeFile(
-    path.join(dir, "opencode.json"),
+    configPath,
     JSON.stringify({
       plugins: [{ package: "opencode-provider-proxy", options }],
     }),
@@ -66,6 +94,7 @@ async function boot(options: unknown, providers: ProviderShape[]) {
 
   let failNextTransform = false
   const emitted: Array<[string, unknown]> = []
+  const sub = makeSubscription()
 
   // The plugin mutates `transform`/`rpc`/`event` against a live ctx. We mock
   // just enough of it to drive the full lifecycle.
@@ -91,9 +120,7 @@ async function boot(options: unknown, providers: ProviderShape[]) {
     },
     event: {
       subscribe() {
-        return (async function* () {
-          while (true) await new Promise(() => {})
-        })()
+        return sub
       },
     },
     rpc: {
@@ -114,8 +141,10 @@ async function boot(options: unknown, providers: ProviderShape[]) {
 
   return {
     dispose,
+    configPath,
     handlers: ctx._handlers as Handlers,
     emitted,
+    subPush: (ev: unknown) => sub.push(ev),
     setFailNextTransform(v: boolean) {
       failNextTransform = v
     },
@@ -167,8 +196,8 @@ describe("plugin lifecycle wiring", () => {
       [{ id: "a", settings: { baseURL: "https://api.example.com" } }],
     )
     try {
-      // Run several rebuilds through the serialized queue.
-      await handlers.updateSettings({ providers: { a: "p1" } })
+      // Run several distinct rebuilds through the serialized queue.
+      await handlers.updateSettings({ providers: { a: null } })
       await handlers.updateSettings({ providers: { a: "p1" } })
 
       expect(gateways.length).toBe(3) // initial + two rebuilds
@@ -195,7 +224,7 @@ describe("plugin lifecycle wiring", () => {
     try {
       setFailNextTransform(true)
       await expect(
-        handlers.updateSettings({ providers: { a: "p1" } }),
+        handlers.updateSettings({ providers: { a: null } }),
       ).rejects.toThrow("simulated transform failure")
 
       // The previous gateway is untouched and still serves the old state.
@@ -210,6 +239,93 @@ describe("plugin lifecycle wiring", () => {
       expect(gateways[1].closed).toBe(true)
     } finally {
       await dispose?.()
+    }
+  })
+
+  it("an RPC update followed by config.updated neither reverts nor spawns a duplicate gateway", async () => {
+    const { dispose, handlers, subPush, gateways } = await boot(
+      {
+        proxies: { p1: { url: "http://proxy1:8080" } },
+        providers: { a: "p1" },
+      },
+      [{ id: "a", settings: { baseURL: "https://api.example.com" } }],
+    )
+    try {
+      expect(gateways.length).toBe(1)
+
+      // RPC clears the mapping: writes the config file and rebuilds.
+      await handlers.updateSettings({ providers: { a: null } })
+      expect(gateways.length).toBe(2)
+      expect(gateways[1].closed).toBe(false)
+
+      // A watcher config.updated fires afterwards. It must read the freshly
+      // written file state (providers: {}), see it matches the applied gateway,
+      // and become a no-op rather than reverting to the stale ctx.options.
+      subPush({ type: "config.updated" })
+      await tick()
+
+      expect(gateways.length).toBe(2) // no double gateway
+      expect(gateways[1].closed).toBe(false) // still live — not reverted
+      expect(await handlers.getSettings()).toMatchObject({
+        active: false,
+        providers: [{ id: "a", proxy: null }],
+      })
+    } finally {
+      await dispose?.()
+    }
+  })
+
+  it("dispose aborts, stops the subscription, and refuses further rebuilds", async () => {
+    const { dispose, handlers, gateways } = await boot(
+      {
+        proxies: { p1: { url: "http://proxy1:8080" } },
+        providers: { a: "p1" },
+      },
+      [{ id: "a", settings: { baseURL: "https://api.example.com" } }],
+    )
+    expect(gateways[0].closed).toBe(false)
+
+    await dispose!()
+
+    expect(gateways[0].closed).toBe(true)
+    // A rebuild after dispose is refused (abort flag) instead of creating a gateway.
+    await expect(
+      handlers.updateSettings({ providers: { a: null } }),
+    ).rejects.toThrow(/shutdown in progress/)
+    expect(gateways.length).toBe(1)
+  })
+
+  it("teardown awaits an in-flight config rebuild and closes every gateway", async () => {
+    const { dispose, subPush, gateways, configPath } = await boot(
+      {
+        proxies: { p1: { url: "http://proxy1:8080" } },
+        providers: { a: "p1" },
+      },
+      [{ id: "a", settings: { baseURL: "https://api.example.com" } }],
+    )
+    // Change the config to a distinct state so config.updated triggers a real rebuild.
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({
+        plugins: [
+          {
+            package: "opencode-provider-proxy",
+            options: {
+              proxies: { p1: { url: "http://proxy1:8080" } },
+              providers: {},
+            },
+          },
+        ],
+      }),
+      "utf8",
+    )
+    subPush({ type: "config.updated" })
+    await new Promise((r) => setTimeout(r, 15)) // let the subscription loop enqueue
+    await dispose!()
+
+    // Whatever gateways were created (including the in-flight rebuild) are closed.
+    for (const g of gateways) {
+      expect(g.closed).toBe(true)
     }
   })
 })
