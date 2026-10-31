@@ -182,27 +182,36 @@ export default Plugin.define({
     })
 
     // Own the keymap layer in an explicit root so it can be disposed on cleanup.
+    // The keymap provider may be absent in some hosts (e.g. headless/remote
+    // TUI); in that case skip the palette command instead of failing setup.
     let disposeLayer: (() => void) | undefined
-    createRoot((dispose) => {
-      disposeLayer = dispose
-      context.keymap.layer(() => ({
-        commands: [
-          {
-            id: "provider-proxy.open",
-            title: "Прокси провайдеров",
-            group: "Provider Proxy",
-            bind: "ctrl+g",
-            palette: true,
-            slash: { name: "proxy-setup" },
-            run: () =>
-              context.ui.router.navigate({
-                type: "plugin",
-                name: "provider-proxy",
-              }),
-          },
-        ],
-      }))
-    })
+    if (context.keymap && typeof context.keymap.layer === "function") {
+      try {
+        createRoot((dispose) => {
+          disposeLayer = dispose
+          context.keymap.layer(() => ({
+            commands: [
+              {
+                id: "provider-proxy.open",
+                title: "Прокси провайдеров",
+                group: "Provider Proxy",
+                bind: "ctrl+g",
+                palette: true,
+                slash: { name: "proxy-setup" },
+                run: () =>
+                  context.ui.router.navigate({
+                    type: "plugin",
+                    name: "provider-proxy",
+                  }),
+              },
+            ],
+          }))
+        })
+      } catch (err) {
+        console.warn("provider-proxy: keymap layer unavailable, skipping palette command", err)
+        disposeLayer = undefined
+      }
+    }
 
     return () => {
       unregister()

@@ -139,6 +139,10 @@ async function boot(options: unknown, providers: ProviderShape[]) {
 
   const dispose = (await plugin.setup(ctx)) as (() => Promise<void>) | undefined
 
+  // Initialization is intentionally off the setup critical path (setTimeout 0);
+  // wait for it so the tests observe the ready state, as they did before.
+  await tick()
+
   return {
     dispose,
     configPath,

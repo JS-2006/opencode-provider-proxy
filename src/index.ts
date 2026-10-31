@@ -134,11 +134,52 @@ export default Plugin.define({
       return run
     }
 
-    await rebuild()
+    // Startup: build the initial gateway/routes OUTSIDE the setup critical path.
+    // Awaiting `ctx.provider.list()` during plugin setup can deadlock the
+    // provider registry (observed as a reload loop), so we schedule the first
+    // rebuild for the next tick and return from setup immediately.
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let attempts = 0
+    const startInit = () => {
+      if (abort.signal.aborted) return
+      rebuild()
+        .then((r) => {
+          clearInterval(retryTimer)
+          console.log(
+            `provider-proxy: active, gateway on 127.0.0.1:${r.gateway.port}, routes=${r.routes.size}`,
+          )
+        })
+        .catch((err) => {
+          console.error("provider-proxy: initial rebuild failed, will retry", err)
+          if (!retryTimer && !abort.signal.aborted) {
+            retryTimer = setInterval(() => {
+              if (abort.signal.aborted || attempts >= 10) {
+                clearInterval(retryTimer)
+                return
+              }
+              attempts += 1
+              rebuild()
+                .then((r) => {
+                  clearInterval(retryTimer)
+                  console.log(
+                    `provider-proxy: rebuilt ok, gateway on 127.0.0.1:${r.gateway.port}, routes=${r.routes.size}`,
+                  )
+                })
+                .catch((e) => console.error("provider-proxy: retry rebuild failed", e))
+            }, 2000)
+          }
+        })
+    }
+    setTimeout(startInit, 0)
 
     registration = await ctx.rpc.register(ProviderProxy, {
       async getSettings() {
-        const running = current as Running
+        const running = current as Running | undefined
+        if (!running) {
+          // Startup init hasn't completed yet (it runs off the setup critical
+          // path); report an empty but valid state.
+          return { active: false, proxies: [], providers: [] }
+        }
         return getSettingsPayload(
           running.normalized,
           providerList(await ctx.provider.list()),
@@ -146,7 +187,8 @@ export default Plugin.define({
       },
       async updateSettings(input) {
         const { providers } = input as { providers: Record<string, string | null> }
-        const running = current as Running
+        const running = current as Running | undefined
+        if (!running) throw new Error("provider-proxy: not ready yet")
 
         // `optionsFromUpdate` encodes providers as `{ proxy: name }` objects
         // (the jsonc persistence shape), but `normalizeOptions` consumes a plain
@@ -200,6 +242,7 @@ export default Plugin.define({
     return async () => {
       // Signal shutdown first: rebuilds started after this point become no-ops.
       abort.abort()
+      if (retryTimer) clearInterval(retryTimer)
       // Stop the config-subscription consumer loop.
       if (typeof (subIter as { return?: unknown }).return === "function") {
         try {
