@@ -37,6 +37,53 @@ describe("normalizeOptions", () => {
     )
   })
 
+  it("accepts the object form for providers", () => {
+    const r = normalizeOptions({
+      proxies: {
+        p1: { url: "http://localhost:8080" },
+        p2: { url: "socks5://proxy.example.com:1080" },
+      },
+      providers: {
+        openai: { proxy: "p1" },
+        anthropic: { proxy: "p2" },
+      },
+    })
+    expect(r.providers.get("openai")).toBe("p1")
+    expect(r.providers.get("anthropic")).toBe("p2")
+  })
+
+  it("accepts a mix of string and object forms for providers", () => {
+    const r = normalizeOptions({
+      proxies: {
+        p1: { url: "http://localhost:8080" },
+      },
+      providers: {
+        openai: "p1",
+        anthropic: { proxy: "p1" },
+      },
+    })
+    expect(r.providers.get("openai")).toBe("p1")
+    expect(r.providers.get("anthropic")).toBe("p1")
+  })
+
+  it("throws when an object provider is missing proxy", () => {
+    expect(() => normalizeOptions({ providers: { openai: {} } })).toThrow(
+      /proxy must be a non-empty string/,
+    )
+  })
+
+  it("throws when an object provider has a non-string proxy", () => {
+    expect(() =>
+      normalizeOptions({ providers: { openai: { proxy: 42 } } }),
+    ).toThrow(/proxy must be a non-empty string/)
+  })
+
+  it("throws when an object provider references an unknown proxy", () => {
+    expect(() =>
+      normalizeOptions({ providers: { openai: { proxy: "nope" } } }),
+    ).toThrow(/nope/)
+  })
+
   it("throws on an unsupported url scheme", () => {
     expect(() =>
       normalizeOptions({ proxies: { p1: { url: "ftp://example.com" } } }),

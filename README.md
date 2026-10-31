@@ -68,8 +68,9 @@ Options are read from the plugin's `options` in `opencode.json(c)`:
   `socks4://`, or `socks5://`) and optionally `username`/`password` for proxy
   authentication.
 - `providers` — an object mapping a **provider id** to the name of a proxy from
-  `proxies`. A provider that is absent (or mapped to nothing) is not routed
-  through a proxy.
+  `proxies`. Each value may be the proxy name as a plain string (`"corp"`) or
+  an object form such as `{ "proxy": "corp" }`; both are equivalent. A provider
+  that is absent (or mapped to nothing) is not routed through a proxy.
 
 Full example:
 
@@ -91,8 +92,8 @@ Full example:
           }
         },
         "providers": {
-          "anthropic": "corp",
-          "openai": "socks"
+          "anthropic": { "proxy": "corp" },
+          "openai": { "proxy": "socks" }
         }
       }
     }

@@ -54,8 +54,20 @@ export function normalizeOptions(raw: unknown): NormalizedOptions {
     if (!isRecord(raw.providers)) {
       errors.push("providers must be an object")
     } else {
-      for (const [providerId, proxyName] of Object.entries(raw.providers)) {
-        if (typeof proxyName !== "string") {
+      for (const [providerId, providerCfg] of Object.entries(raw.providers)) {
+        let proxyName: string
+        if (typeof providerCfg === "string") {
+          proxyName = providerCfg
+        } else if (isRecord(providerCfg)) {
+          const cfgProxy = providerCfg.proxy
+          if (typeof cfgProxy !== "string" || cfgProxy.length === 0) {
+            errors.push(
+              `provider "${providerId}" has an invalid proxy object (proxy must be a non-empty string)`,
+            )
+            continue
+          }
+          proxyName = cfgProxy
+        } else {
           errors.push(`provider "${providerId}" has a non-string proxy reference`)
           continue
         }
