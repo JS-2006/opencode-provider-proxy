@@ -100,7 +100,7 @@ describe("applyRoutes", () => {
 
     expect(transform).toHaveBeenCalledTimes(1)
     const updated = states.get("a")!.settings
-    expect(updated.baseURL).toBe("http://127.0.0.1:7777/a")
+    expect(updated.baseURL).toBe("http://127.0.0.1:7777/a/api")
     expect(updated.transport).toBe("http")
     expect(updated.apiKey).toBe("secret")
 

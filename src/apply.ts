@@ -58,6 +58,22 @@ interface ProviderEditor {
 }
 
 /**
+ * Path portion of the upstream base URL, without a trailing slash. The gateway
+ * route must mirror it so provider SDKs that append an endpoint path (for
+ * example `/chat/completions`) keep hitting the same upstream path they would
+ * have hit without the proxy. Without this, `https://host/v1` would be routed
+ * as `https://host/chat/completions` and return 404.
+ */
+function gatewayBasePath(upstreamBase: string): string {
+  try {
+    const pathname = new URL(upstreamBase).pathname
+    return pathname === "/" ? "" : pathname.replace(/\/+$/, "")
+  } catch {
+    return ""
+  }
+}
+
+/**
  * Rewrite each routed provider's `settings.baseURL` to point at the local
  * gateway and force `transport: "http"`, via the provider transform.
  */
@@ -73,11 +89,12 @@ export async function applyRoutes(
   }
 
   await transform((editor) => {
-    for (const providerId of routes.keys()) {
+    for (const [providerId, spec] of routes) {
+      const basePath = gatewayBasePath(spec.upstreamBase)
       editor.update(providerId, (provider) => {
         provider.settings = {
           ...provider.settings,
-          baseURL: `http://127.0.0.1:${gatewayPort}/${providerId}`,
+          baseURL: `http://127.0.0.1:${gatewayPort}/${providerId}${basePath}`,
           transport: "http",
         }
       })

@@ -274,17 +274,24 @@ function spawnTlsViaProxy(
   port: number,
   proxy: ProxyEndpoint,
 ): { child: ChildProcess; sock: DuplexLike } {
-  const child = spawn("openssl", [
-    "s_client",
-    "-connect",
-    `${host}:${port}`,
-    "-proxy",
-    `${proxy.host}:${proxy.port}`,
-    "-servername",
-    host,
-    "-quiet",
-    "-ign_eof",
-  ])
+  const child = spawn(
+    "openssl",
+    [
+      "s_client",
+      "-connect",
+      `${host}:${port}`,
+      "-proxy",
+      `${proxy.host}:${proxy.port}`,
+      "-servername",
+      host,
+      "-verify_return_error",
+      "-verify_hostname",
+      host,
+      "-quiet",
+      "-ign_eof",
+    ],
+    { stdio: ["pipe", "pipe", "ignore"] },
+  )
   const sock: DuplexLike = {
     on(event, cb) {
       if (event === "data") child.stdout?.on("data", cb as (d: Buffer) => void)
@@ -307,13 +314,6 @@ function spawnTlsViaProxy(
     },
   }
   return { child, sock }
-}
-
-function wrapTls(sock: net.Socket, host: string): Promise<tls.TLSSocket> {
-  return new Promise((resolve, reject) => {
-    const tlssock = tls.connect({ socket: sock, servername: host, host }, () => resolve(tlssock))
-    tlssock.once("error", reject)
-  })
 }
 
 function readResponseHead(buf: Buffer): { status: number; headers: Map<string, string> } {
@@ -355,6 +355,18 @@ async function openWire(
     return { wire: new Wire(sock), destroy: () => sock.destroy(), sock }
   }
 
+  if (useTls) {
+    // Bun cannot layer tls.connect over an existing socket, so delegate the
+    // whole CONNECT + TLS handshake to openssl. This must happen before any
+    // manual CONNECT, otherwise openssl would open a second tunnel and the
+    // first socket would leak.
+    if (proxy.scheme !== "http") {
+      throw new Error("https through a SOCKS proxy is not supported")
+    }
+    const { sock: tlssock, child } = spawnTlsViaProxy(host, port, proxy)
+    return { wire: new Wire(tlssock), destroy: () => child.kill("SIGKILL"), sock: tlssock }
+  }
+
   const proxySock = await connectTcp(proxy.host, proxy.port)
   const hs = makeHandshakeReader(proxySock)
 
@@ -375,11 +387,7 @@ async function openWire(
       throw new Error(`proxy CONNECT failed with status ${parsed.status}`)
     }
     hs.detach()
-    if (!useTls) return { wire: new Wire(proxySock), destroy: () => proxySock.destroy(), sock: proxySock }
-    // Bun cannot layer tls.connect over an existing socket; route the TLS
-    // handshake through openssl s_client -proxy instead.
-    const { sock: tlssock, child } = spawnTlsViaProxy(host, port, proxy)
-    return { wire: new Wire(tlssock), destroy: () => child.kill("SIGKILL"), sock: tlssock }
+    return { wire: new Wire(proxySock), destroy: () => proxySock.destroy(), sock: proxySock }
   }
 
   // SOCKS5
@@ -442,12 +450,7 @@ async function openWire(
   await hs.n(2)
   hs.detach()
 
-  if (!useTls) return { wire: new Wire(proxySock), destroy: () => proxySock.destroy(), sock: proxySock }
-  // Bun cannot layer tls.connect over an existing socket; use openssl s_client
-  // with its CONNECT proxy support for SOCKS-reached TLS as well (the proxy
-  // endpoint here must be an HTTP CONNECT proxy for -proxy to work).
-  const { sock: tlssock, child } = spawnTlsViaProxy(host, port, proxy)
-  return { wire: new Wire(tlssock), destroy: () => child.kill("SIGKILL"), sock: tlssock }
+  return { wire: new Wire(proxySock), destroy: () => proxySock.destroy(), sock: proxySock }
 }
 
 // ---------------------------------------------------------------------------
