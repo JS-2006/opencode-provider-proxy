@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { parseTree, type Node } from "jsonc-parser"
+import { parse, parseTree, type Node } from "jsonc-parser"
 import {
   findPluginConfigFile,
   PLUGIN_NAMES,
@@ -72,6 +72,52 @@ describe("updatePluginOptions", () => {
     const updated = await fs.readFile(file, "utf8")
     expect(updated).toContain('"b":2')
     expect(updated).toContain('"./plugins/provider-proxy"')
+  })
+
+  it("converts a plain string-form plugin entry to object form on update", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jsonc-test-"))
+    const file = path.join(dir, "opencode.jsonc")
+    await fs.copyFile(path.join(fixturesDir, "string-form.opencode.jsonc"), file)
+    const orig = await fs.readFile(file, "utf8")
+    const newOptions = { c: 3 }
+
+    await updatePluginOptions(file, newOptions)
+
+    const updated = await fs.readFile(file, "utf8")
+    // The scalar string entry must be replaced by an object preserving the
+    // original package value; everything else stays byte-identical.
+    const entry = entryNode(orig, 0)
+    const pkg = entry.value as string
+    const expected =
+      orig.slice(0, entry.offset) +
+      JSON.stringify({ package: pkg, options: newOptions }) +
+      orig.slice(entry.offset + entry.length)
+    expect(updated).toBe(expected)
+    expect(parse(updated).plugins[0]).toEqual({
+      package: "opencode-provider-proxy",
+      options: { c: 3 },
+    })
+  })
+
+  it("converts a string-form plugin entry with a relative package path on update", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jsonc-test-"))
+    const file = path.join(dir, "opencode.jsonc")
+    await fs.copyFile(path.join(fixturesDir, "string-form-path.opencode.jsonc"), file)
+    const orig = await fs.readFile(file, "utf8")
+
+    await updatePluginOptions(file, { d: 4 })
+
+    const updated = await fs.readFile(file, "utf8")
+    const entry = entryNode(orig, 0)
+    const expected =
+      orig.slice(0, entry.offset) +
+      JSON.stringify({ package: entry.value, options: { d: 4 } }) +
+      orig.slice(entry.offset + entry.length)
+    expect(updated).toBe(expected)
+    expect(parse(updated).plugins[0]).toEqual({
+      package: "./plugins/provider-proxy",
+      options: { d: 4 },
+    })
   })
 })
 
@@ -154,6 +200,18 @@ function optsNode(text: string): Node {
   const node = optProp?.children?.[1]
   if (!node) throw new Error("options node not found")
   return node
+}
+
+function entryNode(text: string, index: number): Node {
+  const tree = parseTree(text)
+  if (!tree) throw new Error("fixture did not parse")
+  const pluginsProp = tree.children?.find(
+    (c) => c.type === "property" && c.children?.[0]?.value === "plugins",
+  )
+  const arr = pluginsProp?.children?.[1]
+  const entry = arr?.children?.[index]
+  if (!entry) throw new Error("plugin entry not found")
+  return entry
 }
 
 function restoreEnv(name: string, value: string | undefined) {

@@ -91,6 +91,22 @@ function editConfigText(text: string, options: unknown): string {
     )
   }
 
+  const element = pluginsNode.children?.[idx]
+  // A matched entry in string form (e.g. "opencode-provider-proxy" or
+  // "./plugins/provider-proxy") cannot carry an `options` node. Convert it to
+  // object form, preserving the original package value.
+  if (element?.type === "string") {
+    return applyEdits(
+      text,
+      modify(
+        text,
+        ["plugins", idx],
+        { package: element.value as string, options },
+        {},
+      ),
+    )
+  }
+
   const path: JSONPath = ["plugins", idx, "options"]
   return applyEdits(text, modify(text, path, options, {}))
 }

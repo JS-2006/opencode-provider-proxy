@@ -1,0 +1,6 @@
+{
+  "plugins": [
+    "opencode-provider-proxy",
+    "some-other-plugin",
+  ],
+}
