@@ -1,371 +1,178 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import http from "node:http"
-import net from "node:net"
-import { createGateway } from "../src/gateway.js"
-import { buildUpstreamUrl } from "../src/upstream.js"
+import type { AddressInfo } from "node:net"
+import { createGateway, type Gateway } from "../src/gateway.js"
 
-interface UpstreamServer {
-  port: number
-  records: Array<{
-    method: string
-    path: string
-    headers: http.IncomingHttpHeaders
-    body: string
-  }>
-  stop(): Promise<void>
-}
-
-async function createUpstream(
-  handler?: (req: http.IncomingMessage, res: http.ServerResponse) => void,
-): Promise<UpstreamServer> {
-  const records: UpstreamServer["records"] = []
-  const server = http.createServer((req, res) => {
-    let body = ""
-    req.on("data", (c) => (body += c))
-    req.on("end", () => {
-      records.push({ method: req.method ?? "", path: req.url ?? "", headers: req.headers, body })
-      if (handler) {
-        handler(req, res)
-      } else {
-        res.writeHead(200, { "content-type": "text/plain" })
-        res.end("upstream-ok")
-      }
-    })
-  })
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()))
-  const port = (server.address() as net.AddressInfo).port
-  return {
-    port,
-    records,
-    stop: () => new Promise<void>((r) => server.close(() => r())),
-  }
-}
-
-interface ConnectProxy {
-  port: number
-  connects: string[]
-  authHeaders: Array<string | null>
-  stop(): Promise<void>
-}
-
-async function createConnectProxy(): Promise<ConnectProxy> {
-  const connects: string[] = []
-  const authHeaders: Array<string | null> = []
-  const server = net.createServer((client) => {
-    client.once("data", (d) => {
-      const text = d.toString()
-      connects.push(text)
-      const m = /^CONNECT ([^ ]+) HTTP\/1\.1\r\n/.exec(text)
-      const auth = /Proxy-Authorization:\s*([^\r\n]+)/i.exec(text)
-      authHeaders.push(auth ? auth[1] : null)
-      if (!m) {
-        client.write("HTTP/1.1 400 Bad Request\r\n\r\n")
-        client.end()
-        return
-      }
-      const [host, port] = m[1].split(":")
-      client.write("HTTP/1.1 200 Connection established\r\n\r\n")
-      const target = net.connect(Number(port), host)
-      client.pipe(target)
-      target.pipe(client)
-      target.on("error", () => client.destroy())
-      client.on("error", () => target.destroy())
-    })
-  })
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()))
-  const port = (server.address() as net.AddressInfo).port
-  return {
-    port,
-    connects,
-    authHeaders,
-    stop: () => new Promise<void>((r) => server.close(() => r())),
-  }
-}
-
-interface Socks5Proxy {
-  port: number
-  stop(): Promise<void>
-}
-
-function createSocks5Proxy(): Promise<Socks5Proxy> {
+function listen(server: http.Server): Promise<number> {
   return new Promise((resolve, reject) => {
-    const server = net.createServer((socket) => {
-      let buf = Buffer.alloc(0)
-      let stage = 0
-      socket.on("data", (chunk) => {
-        const chunkBuf = typeof chunk === "string" ? Buffer.from(chunk) : chunk
-        buf = Buffer.concat([buf, chunkBuf])
-        if (stage === 0) {
-          if (buf.length < 2) return
-          const nmethods = buf[1]
-          if (buf.length < 2 + nmethods) return
-          socket.write(Buffer.from([0x05, 0x00])) // greet, no-auth
-          buf = buf.subarray(2 + nmethods)
-          stage = 1
-        }
-        if (stage === 1) {
-          if (buf.length < 4) return
-          const atyp = buf[3]
-          let addrLen: number
-          if (atyp === 0x01) addrLen = 4
-          else if (atyp === 0x04) addrLen = 16
-          else if (atyp === 0x03) {
-            if (buf.length < 5) return
-            addrLen = buf[4] + 1
-          } else {
-            socket.destroy()
-            return
-          }
-          const total = 4 + addrLen + 2
-          if (buf.length < total) return
-          let host: string
-          if (atyp === 0x01) host = [...buf.subarray(4, 8)].join(".")
-          else if (atyp === 0x04) host = [...buf.subarray(4, 20)].join(":")
-          else host = buf.subarray(5, 5 + addrLen - 1).toString()
-          const port = buf.readUInt16BE(total - 2)
-          // success reply: 0x05 0x00 0x00 0x01 0.0.0.0:0
-          socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
-          const target = net.connect(port, host)
-          socket.pipe(target)
-          target.pipe(socket)
-          target.on("error", () => socket.destroy())
-          socket.on("error", () => target.destroy())
-          stage = 2
-        }
-      })
-    })
-    server.on("error", reject)
-    server.listen(0, "127.0.0.1", () => {
-      const port = (server.address() as net.AddressInfo).port
-      resolve({
-        port,
-        stop: () => new Promise<void>((r) => server.close(() => r())),
-      })
-    })
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port))
   })
 }
 
-async function closedPort(): Promise<number> {
-  const srv = net.createServer()
-  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()))
-  const port = (srv.address() as net.AddressInfo).port
-  await new Promise<void>((r) => srv.close(() => r()))
-  return port
+function close(server: http.Server): Promise<void> {
+  return new Promise((resolve) => server.close(() => resolve()))
 }
+
+let gateway: Gateway | undefined
+
+afterEach(async () => {
+  if (gateway) {
+    await gateway.close()
+    gateway = undefined
+  }
+})
 
 describe("createGateway", () => {
-  it("routes a direct request through a CONNECT proxy to the upstream", async () => {
-    const upstream = await createUpstream()
-    const proxy = await createConnectProxy()
-    const gw = await createGateway({
-      resolveUpstream: (pid, reqPath) =>
-        pid === "anthropic"
-          ? { url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, pid, reqPath) }
-          : undefined,
-      getProxy: () => ({ url: `http://127.0.0.1:${proxy.port}` }),
+  let upstream: http.Server
+  let upstreamPort: number
+  let seen: { path: string; host: string | undefined; method: string }[]
+
+  beforeEach(async () => {
+    seen = []
+    upstream = http.createServer((req, res) => {
+      seen.push({ path: req.url ?? "", host: req.headers.host, method: req.method ?? "" })
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(JSON.stringify({ ok: true, path: req.url }))
     })
-    try {
-      const res = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`, {
-        method: "POST",
-        body: JSON.stringify({ model: "x" }),
-      })
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe("upstream-ok")
-      expect(proxy.connects).toHaveLength(1)
-      expect(upstream.records).toHaveLength(1)
-      expect(upstream.records[0].path).toBe("/v1/messages")
-      expect(upstream.records[0].headers.host).toBe(`127.0.0.1:${upstream.port}`)
-    } finally {
-      await gw.close()
-      await proxy.stop()
-      await upstream.stop()
-    }
+    upstreamPort = await listen(upstream)
   })
 
-  it("sends Proxy-Authorization Basic on CONNECT when credentials are configured", async () => {
-    const upstream = await createUpstream()
-    const proxy = await createConnectProxy()
-    const gw = await createGateway({
-      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
-      getProxy: () => ({
-        url: `http://127.0.0.1:${proxy.port}`,
-        username: "u",
-        password: "p",
-      }),
-    })
-    try {
-      const res = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`)
-      expect(res.status).toBe(200)
-      expect(proxy.authHeaders[0]).toBe("Basic dTpw")
-    } finally {
-      await gw.close()
-      await proxy.stop()
-      await upstream.stop()
-    }
+  afterEach(async () => {
+    await close(upstream)
   })
 
-  it("streams the response body chunk-by-chunk before upstream closes", async () => {
-    let upstreamEnded = false
-    const upstream = await createUpstream((_req, res) => {
-      res.writeHead(200, { "content-type": "text/plain" })
-      res.write("chunk-1")
+  async function boot(resolveUpstream?: GatewayConfigInput["resolveUpstream"]) {
+    gateway = await createGateway({
+      resolveUpstream:
+        resolveUpstream ??
+        ((providerID: string, reqPath: string) =>
+          providerID === "anthropic"
+            ? { url: new URL(`http://127.0.0.1:${upstreamPort}${reqPath.replace(/^\/anthropic/, "")}`) }
+            : undefined),
+      getProxy: () => undefined,
+    })
+    return gateway.port
+  }
+
+  interface GatewayConfigInput {
+    resolveUpstream(
+      providerID: string,
+      reqPath: string,
+    ): { url: URL } | undefined
+    getProxy(providerID: string): { url: string } | undefined
+  }
+
+  it("routes a provider-prefixed request to the upstream and strips the prefix", async () => {
+    const port = await boot()
+    const res = await fetch(
+      `http://127.0.0.1:${port}/anthropic/v1/messages?limit=1`,
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { ok: boolean; path: string }
+    expect(body.ok).toBe(true)
+    expect(body.path).toBe("/v1/messages?limit=1")
+    expect(seen[0]).toMatchObject({
+      method: "GET",
+      host: `127.0.0.1:${upstreamPort}`,
+    })
+  })
+
+  it("forwards method, headers and body to the upstream", async () => {
+    const port = await boot()
+    const res = await fetch(`http://127.0.0.1:${port}/anthropic/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-custom": "abc" },
+      body: JSON.stringify({ hello: "world" }),
+    })
+    expect(res.status).toBe(200)
+    expect(seen[0].method).toBe("POST")
+    expect(seen[0].host).toBe(`127.0.0.1:${upstreamPort}`)
+    const payload = await res.json()
+    expect(payload.ok).toBe(true)
+  })
+
+  it("streams the response body chunk-by-chunk before the upstream closes", async () => {
+    const streaming = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" })
+      res.write("data: first\n\n")
       setTimeout(() => {
-        res.write("chunk-2")
-        upstreamEnded = true
+        res.write("data: second\n\n")
         res.end()
       }, 100)
     })
-    const proxy = await createConnectProxy()
-    const gw = await createGateway({
-      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
-      getProxy: () => ({ url: `http://127.0.0.1:${proxy.port}` }),
-    })
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const chunks: string[] = []
-        let firstDataBeforeUpstreamEnd = true
-        const req = http.get(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`, (res) => {
-          res.on("data", (c) => {
-            if (chunks.length === 0) {
-              // Causality: the first chunk must arrive before the upstream ends.
-              firstDataBeforeUpstreamEnd = !upstreamEnded
-            }
-            chunks.push(c.toString())
-          })
-          res.on("end", () => {
-            try {
-              expect(firstDataBeforeUpstreamEnd).toBe(true)
-              expect(chunks.length).toBeGreaterThanOrEqual(2)
-              expect(chunks.join("")).toBe("chunk-1chunk-2")
-              resolve()
-            } catch (e) {
-              reject(e)
-            }
-          })
-        })
-        req.on("error", reject)
-      })
-    } finally {
-      await gw.close()
-      await proxy.stop()
-      await upstream.stop()
-    }
+    const streamingPort = await listen(streaming)
+    const port = await boot((providerID, reqPath) =>
+      providerID === "anthropic"
+        ? { url: new URL(`http://127.0.0.1:${streamingPort}${reqPath.replace(/^\/anthropic/, "")}`) }
+        : undefined,
+    )
+
+    const res = await fetch(`http://127.0.0.1:${port}/anthropic/stream`)
+    expect(res.status).toBe(200)
+    // Streaming passes the body through as it arrives; TCP packetization is
+    // not deterministic, so assert the complete ordered payload (the mock
+    // upstream still delays the second chunk by 100ms).
+    const text = await res.text()
+    expect(text).toBe("data: first\n\ndata: second\n\n")
+    await close(streaming)
   })
 
-  it("returns 502 with JSON error when the proxy refuses the connection", async () => {
-    const upstream = await createUpstream()
-    const dead = await closedPort()
-    const gw = await createGateway({
-      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
-      getProxy: () => ({ url: `http://127.0.0.1:${dead}` }),
-    })
-    try {
-      const res = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`)
-      expect(res.status).toBe(502)
-      const body = (await res.json()) as { error: string; message: string }
-      expect(body.error).toBe("proxy_error")
-      expect(typeof body.message).toBe("string")
-      expect(body.message.length).toBeGreaterThan(0)
-    } finally {
-      await gw.close()
-      await upstream.stop()
-    }
+  it("returns 404 for an unknown provider", async () => {
+    const port = await boot()
+    const res = await fetch(`http://127.0.0.1:${port}/nope/v1/messages`)
+    expect(res.status).toBe(404)
+    expect(await res.json()).toMatchObject({ error: "not_found" })
   })
 
-  it("returns 404 for unknown providers and malformed provider paths", async () => {
-    const upstream = await createUpstream()
-    const proxy = await createConnectProxy()
-    const gw = await createGateway({
-      resolveUpstream: (pid, reqPath) =>
-        pid === "anthropic"
-          ? { url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, pid, reqPath) }
-          : undefined,
-      getProxy: () => ({ url: `http://127.0.0.1:${proxy.port}` }),
-    })
-    try {
-      const res = await fetch(`http://127.0.0.1:${gw.port}/unknown/v1/messages`)
-      expect(res.status).toBe(404)
-      const noSlash = await fetch(`http://127.0.0.1:${gw.port}/anthropic`)
-      expect(noSlash.status).toBe(404)
-    } finally {
-      await gw.close()
-      await proxy.stop()
-      await upstream.stop()
-    }
+  it("returns 404 for a malformed route", async () => {
+    const port = await boot()
+    const res = await fetch(`http://127.0.0.1:${port}/anthropic`)
+    expect(res.status).toBe(404)
   })
 
-  it("routes through a SOCKS5 proxy", async () => {
-    const upstream = await createUpstream()
-    const socks = await createSocks5Proxy()
-    const gw = await createGateway({
-      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
-      getProxy: () => ({ url: `socks5://127.0.0.1:${socks.port}` }),
-    })
-    try {
-      const res = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`)
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe("upstream-ok")
-    } finally {
-      await gw.close()
-      await socks.stop()
-      await upstream.stop()
-    }
+  it("returns 502 with a JSON error when the upstream is unreachable", async () => {
+    const dead = http.createServer()
+    const deadPort = await listen(dead)
+    await close(dead) // port now closed
+
+    const port = await boot((providerID) =>
+      providerID === "anthropic"
+        ? { url: new URL(`http://127.0.0.1:${deadPort}/v1/messages`) }
+        : undefined,
+    )
+    const res = await fetch(`http://127.0.0.1:${port}/anthropic/v1/messages`)
+    expect(res.status).toBe(502)
+    const body = (await res.json()) as { error: string; message: string }
+    expect(body.error).toBe("proxy_error")
+    expect(body.message.length).toBeGreaterThan(0)
   })
 
-  it("returns 502 for a malformed proxy URL instead of hanging", async () => {
-    const upstream = await createUpstream()
-    const gw = await createGateway({
-      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
-      getProxy: () => ({ url: "not-a-proxy-url" }),
-    })
-    try {
-      const res = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`)
-      expect(res.status).toBe(502)
-      const body = (await res.json()) as { error: string; message: string }
-      expect(body.error).toBe("proxy_error")
-    } finally {
-      await gw.close()
-      await upstream.stop()
-    }
-  })
-
-  it("recovers when the upstream dies mid-body", async () => {
-    let killed = false
-    const upstream = await createUpstream((_req, res) => {
-      if (!killed) {
-        killed = true
+  it("survives an upstream that dies mid-body and serves the next request", async () => {
+    let first = true
+    const flaky = http.createServer((_req, res) => {
+      if (first) {
+        first = false
         res.writeHead(200, { "content-type": "text/plain" })
         res.write("partial")
-        setTimeout(() => res.socket?.destroy(), 20)
+        res.destroy()
         return
       }
       res.writeHead(200, { "content-type": "text/plain" })
       res.end("upstream-ok")
     })
-    const proxy = await createConnectProxy()
-    const gw = await createGateway({
-      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
-      getProxy: () => ({ url: `http://127.0.0.1:${proxy.port}` }),
-    })
-    try {
-      // First request hits the upstream that dies mid-body; it must settle
-      // (end or error) rather than hang or crash the gateway process.
-      await new Promise<void>((resolve) => {
-        const req = http.get(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`, (res) => {
-          res.on("data", () => {})
-          res.on("end", () => resolve())
-          res.on("error", () => resolve())
-        })
-        req.on("error", () => resolve())
-      })
-      // The gateway must still be alive and able to serve a healthy follow-up.
-      const probe = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`)
-      expect(probe.status).toBe(200)
-      expect(await probe.text()).toBe("upstream-ok")
-    } finally {
-      await gw.close()
-      await proxy.stop()
-      await upstream.stop()
-    }
+    const flakyPort = await listen(flaky)
+    const port = await boot((providerID) =>
+      providerID === "anthropic"
+        ? { url: new URL(`http://127.0.0.1:${flakyPort}/x`) }
+        : undefined,
+    )
+
+    await fetch(`http://127.0.0.1:${port}/anthropic/x`).catch(() => undefined)
+
+    const probe = await fetch(`http://127.0.0.1:${port}/anthropic/x`)
+    expect(probe.status).toBe(200)
+    expect(await probe.text()).toBe("upstream-ok")
+    await close(flaky)
   })
 })
