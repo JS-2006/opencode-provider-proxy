@@ -44,11 +44,20 @@ export default Plugin.define({
       try {
         for await (const _event of subscription) {
           if (abort.signal.aborted) break
-          await current.gateway.close()
-          current = await startGateway()
+          try {
+            // Build the new gateway first; only on success swap it in and
+            // close the old one. If the rebuild fails, keep the old gateway
+            // running so the proxy is not left dead.
+            const next = await startGateway()
+            const previous = current
+            current = next
+            await previous.gateway.close()
+          } catch (err) {
+            console.error("provider-proxy: rebuild failed, keeping existing gateway active", err)
+          }
         }
-      } catch {
-        // subscription ended; nothing to clean up here
+      } catch (err) {
+        console.error("provider-proxy: config subscription ended unexpectedly", err)
       }
     })()
 
