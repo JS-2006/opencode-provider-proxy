@@ -1,0 +1,6 @@
+{
+  // nested config that owns the proxy plugin
+  "plugins": [
+    { "package": "opencode-provider-proxy", "options": { "a": 1 } },
+  ],
+}

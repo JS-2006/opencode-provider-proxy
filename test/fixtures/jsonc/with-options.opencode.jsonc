@@ -1,0 +1,8 @@
+{
+  // top-level comment
+  "version": 1,
+  "plugins": [
+    { "package": "opencode-provider-proxy", "options": { "proxies": {} } }, // proxy plugin
+    "some-other-plugin",
+  ],
+}
