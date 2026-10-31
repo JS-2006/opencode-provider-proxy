@@ -307,4 +307,61 @@ describe("createGateway", () => {
       await upstream.stop()
     }
   })
+
+  it("returns 502 for a malformed proxy URL instead of hanging", async () => {
+    const upstream = await createUpstream()
+    const gw = await createGateway({
+      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
+      getProxy: () => ({ url: "not-a-proxy-url" }),
+    })
+    try {
+      const res = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`)
+      expect(res.status).toBe(502)
+      const body = (await res.json()) as { error: string; message: string }
+      expect(body.error).toBe("proxy_error")
+    } finally {
+      await gw.close()
+      await upstream.stop()
+    }
+  })
+
+  it("recovers when the upstream dies mid-body", async () => {
+    let killed = false
+    const upstream = await createUpstream((_req, res) => {
+      if (!killed) {
+        killed = true
+        res.writeHead(200, { "content-type": "text/plain" })
+        res.write("partial")
+        setTimeout(() => res.socket?.destroy(), 20)
+        return
+      }
+      res.writeHead(200, { "content-type": "text/plain" })
+      res.end("upstream-ok")
+    })
+    const proxy = await createConnectProxy()
+    const gw = await createGateway({
+      resolveUpstream: () => ({ url: buildUpstreamUrl(`http://127.0.0.1:${upstream.port}/v1`, "anthropic", "/anthropic/v1/messages") }),
+      getProxy: () => ({ url: `http://127.0.0.1:${proxy.port}` }),
+    })
+    try {
+      // First request hits the upstream that dies mid-body; it must settle
+      // (end or error) rather than hang or crash the gateway process.
+      await new Promise<void>((resolve) => {
+        const req = http.get(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`, (res) => {
+          res.on("data", () => {})
+          res.on("end", () => resolve())
+          res.on("error", () => resolve())
+        })
+        req.on("error", () => resolve())
+      })
+      // The gateway must still be alive and able to serve a healthy follow-up.
+      const probe = await fetch(`http://127.0.0.1:${gw.port}/anthropic/v1/messages`)
+      expect(probe.status).toBe(200)
+      expect(await probe.text()).toBe("upstream-ok")
+    } finally {
+      await gw.close()
+      await proxy.stop()
+      await upstream.stop()
+    }
+  })
 })

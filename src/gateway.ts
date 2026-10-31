@@ -89,6 +89,17 @@ export async function createGateway(cfg: GatewayConfig): Promise<Gateway> {
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
+    try {
+      await handleInner(req, res)
+    } catch (err) {
+      respondProxyError(res, err)
+    }
+  }
+
+  async function handleInner(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
     const match = ROUTE_RE.exec(req.url ?? "")
     if (!match) {
       respondNotFound(res)
@@ -141,6 +152,7 @@ export async function createGateway(cfg: GatewayConfig): Promise<Gateway> {
           resHeaders[key] = value
         }
         res.writeHead(upstreamRes.statusCode ?? 502, resHeaders)
+        upstreamRes.on("error", () => res.destroy())
         upstreamRes.pipe(res)
       },
     )
