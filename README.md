@@ -22,8 +22,8 @@
 ```
          OpenCode (server, Bun)
  ┌────────────────────────────────────────────┐
- │  provider:inception                        │
- │    settings.baseURL = http://127.0.0.1:PORT/inception/v1
+ │  provider:my-provider                       │
+ │    settings.baseURL = http://127.0.0.1:PORT/my-provider/v1
  │    settings.transport = "http"             │
  └───────────────┬────────────────────────────┘
                  │  HTTP-запрос
@@ -32,8 +32,8 @@
  │  Локальный gateway (порт 127.0.0.1:PORT)   │
  │  src/gateway.ts                            │
  │                                            │
- │  route: /inception/v1/*  →  upstream:      │
- │    https://api.inceptionlabs.ai/v1/*       │
+ │  route: /my-provider/v1/*  →  upstream:    │
+ │    https://api.example.com/v1/*             │
  └───────────────┬────────────────────────────┘
                  │  CONNECT / SOCKS5 / TLS
                  ▼
@@ -46,8 +46,8 @@
 ```
 
 1. **Серверная часть** (`src/index.ts`) при старте запускает локальный HTTP-gateway на `127.0.0.1` (случайный порт).
-2. Для каждого провайдера из `options.providers` плагин переписывает его `settings.baseURL` на gateway и принудительно ставит `settings.transport: "http"`. **Путь оригинального baseURL сохраняется**: например, `https://api.inceptionlabs.ai/v1` → `http://127.0.0.1:PORT/inception/v1`.
-3. Gateway принимает запрос, снимает префикс `/inception`, восстанавливает оригинальный upstream-URL и передаёт запрос через прокси.
+2. Для каждого провайдера из `options.providers` плагин переписывает его `settings.baseURL` на gateway и принудительно ставит `settings.transport: "http"`. **Путь оригинального baseURL сохраняется**: например, `https://api.example.com/v1` → `http://127.0.0.1:PORT/my-provider/v1`.
+3. Gateway принимает запрос, снимает префикс `/my-provider`, восстанавливает оригинальный upstream-URL и передаёт запрос через прокси.
 4. Если провайдер не указан в настройках — его `baseURL` не меняется, трафик идёт как обычно.
 
 ### Транспорт прокси
@@ -90,8 +90,8 @@ git clone <URL-репозитория> ~/projects/opencode-provider-proxy
           "local-http": { "url": "http://127.0.0.1:10808" }
         },
         "providers": {
-          "inception": { "proxy": "local-http" },
-          "kilo": { "proxy": "local-http" }
+          "my-provider": { "proxy": "local-http" },
+          "another-provider": { "proxy": "local-http" }
         }
       }
     }
@@ -165,7 +165,7 @@ provider-proxy: active, gateway on 127.0.0.1:PORT, routes=2
 
 Значение `providers.<id>` может быть:
 
-- строкой — имя прокси: `"inception": "local-http"`;
+- строкой — имя прокси: `"my-provider": "local-http"`;
 - объектом — `{ "proxy": "local-http" }` (эквивалентно; именно эту форму записывает TUI/RPC).
 
 Провайдер, отсутствующий в `providers` (или с `null`), остаётся «напрямую».
@@ -185,8 +185,8 @@ provider-proxy: active, gateway on 127.0.0.1:PORT, routes=2
           }
         },
         "providers": {
-          "inception": { "proxy": "local-http" },
-          "kilo": { "proxy": "local-http" }
+          "my-provider": { "proxy": "local-http" },
+          "another-provider": { "proxy": "local-http" }
         }
       }
     }
@@ -210,8 +210,8 @@ provider-proxy: active, gateway on 127.0.0.1:PORT, routes=2
   }
 },
 "providers": {
-  "anthropic": { "proxy": "corp" },
-  "zai": { "proxy": "corp-socks" }
+  "my-provider": { "proxy": "corp" },
+  "another-provider": { "proxy": "corp-socks" }
 }
 ```
 
@@ -232,7 +232,7 @@ provider-proxy: active, gateway on 127.0.0.1:PORT, routes=2
 - меняет `settings.baseURL` на `http://127.0.0.1:PORT/<providerId><путь из оригинального baseURL>`;
 - ставит `settings.transport: "http"`.
 
-Это видно в API (см. [Проверка](#проверка-работы)). Например, для `inception` с оригинальным `https://api.inceptionlabs.ai/v1` станет `http://127.0.0.1:34505/inception/v1`, для `kilo` `https://api.kilo.ai/api/gateway` → `http://127.0.0.1:34505/kilo/api/gateway`.
+Это видно в API (см. [Проверка](#проверка-работы)). Например, для `my-provider` с оригинальным `https://api.example.com/v1` станет `http://127.0.0.1:34505/my-provider/v1`.
 
 ### Динамическая настройка: TUI и RPC
 
@@ -249,12 +249,12 @@ provider-proxy: active, gateway on 127.0.0.1:PORT, routes=2
    opencode api get /api/provider
    ```
 
-   У `inception`/`kilo` должен быть `baseURL` вида `http://127.0.0.1:PORT/...`, у остальных — оригинальный.
+   У `my-provider`/`another-provider` должен быть `baseURL` вида `http://127.0.0.1:PORT/...`, у остальных — оригинальный.
 
 2. Отправьте запрос к провайдеру через прокси:
 
    ```bash
-   opencode run -m inception/mercury-3 "Скажи: OK"
+   opencode run -m my-provider/my-model "Скажи: OK"
    ```
 
    Успешный ответ модели означает, что цепочка gateway → прокси → upstream работает.
@@ -280,7 +280,7 @@ provider-proxy: active, gateway on 127.0.0.1:PORT, routes=2
 | Плагин `failed` в `/api/plugin` | Смотрите лог `~/.local/share/opencode/log/opencode.log`: причина обычно в ошибке импорта или в опциях. Также проверьте, что путь `package` корректен и содержит `package.json` с `exports`. |
 | `proxy_error` в ответе провайдера | Это ошибка *старой* реализации (fetch/proxy-agent). В текущей версии транспорт сырых сокетов не использует `proxy-agent`; если `proxy_error` появился — вероятно, сервер OpenCode использует устаревший код плагина (перезагрузите: сохраните конфиг или `/reload`). |
 | Ошибка `Invalid URL` | В конфиге `url` прокси или upstream-адрес составлен неверно (например, забыт слэш). Проверьте `proxies[].url` и `providers`. |
-| `404` от API провайдера | Путь не сохранился: убедитесь, что upstream `baseURL` провайдера содержит путь (например `/v1`), и что `/api/provider` показывает его в `baseURL` gateway (например `.../inception/v1`). |
+| `404` от API провайдера | Путь не сохранился: убедитесь, что upstream `baseURL` провайдера содержит путь (например `/v1`), и что `/api/provider` показывает его в `baseURL` gateway (например `.../my-provider/v1`). |
 | `upstream body idle timeout` / зависание | Upstream не шлёт `Content-Length`/`Transfer-Encoding` и держит соединение открытым. Для нефреймленных тел применяется idle-таймаут 2 с; для реальных API (всегда с CL/TE) это не влияет. |
 | Ошибка TLS `SSL routines` при HTTPS через прокси | Проверьте, что установлен `openssl` и доступен в `PATH`. Убедитесь, что прокси — HTTP CONNECT (а не SOCKS), для HTTPS-апстримов. |
 | `CONNECT failed with status ...` | Прокси отверг туннель (часто требуется авторизация). Добавьте `username`/`password` в определение прокси. |
