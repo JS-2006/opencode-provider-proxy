@@ -107,28 +107,30 @@ npm test             # прогон тестов (vitest)
 Путь `package` — абсолютный путь к директории с `package.json` плагина.  
 **Вариант B. Локально (для конкретного проекта)**  
 Два способа:  
-1. **Автоматическое обнаружение.** Положите плагин в `.opencode/plugins/` проекта:  
-2.   
-```  
-<проект>/.opencode/  
-   plugins/  
-     provider-proxy/   # копия репозитория или symlink  
-   
-```  
-3. Плагины из `.opencode/plugins/` загружаются автоматически, без правки конфига.  
-4. **Явная ссылка в конфиге проекта** (`opencode.json(c)` в корне проекта или `.opencode/opencode.json(c)`):  
-5.   
-```  
-{  
-   "plugins": [  
-     {  
-       "package": "../shared/opencode-provider-proxy",  
-       "options": { /* ... */ }  
-     }  
-   ]  
- }  
-   
-```  
+1. **Автоматическое обнаружение.** Положите плагин в `.opencode/plugins/` проекта:
+
+   ```text
+   <проект>/.opencode/
+     plugins/
+       provider-proxy/   # копия репозитория или symlink
+   ```
+
+   Плагины из `.opencode/plugins/` загружаются автоматически, без правки конфига.
+
+2. **Явная ссылка в конфиге проекта** (`opencode.json(c)` в корне проекта или `.opencode/opencode.json(c)`):
+
+   ```jsonc
+   {
+     "plugins": [
+       {
+         "package": "../shared/opencode-provider-proxy",
+         "options": { /* ... */ }
+       }
+     ]
+   }
+   ```
+   ```
+
 **Проверка установки**  
 Конфиг подхватывается автоматически (watcher). Проверьте, что плагин активен:  
 ```  
