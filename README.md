@@ -1,99 +1,97 @@
 # opencode-provider-proxy
 
-A plugin for [OpenCode v2](https://opencode.ai/v2/docs/) that routes the traffic
-of **selected providers** through configured **forward proxies** (HTTP CONNECT
-or SOCKS5, with optional authentication). The "provider → proxy" mapping is set
-in the OpenCode config (`opencode.json(c)`) and can be edited live from a TUI
-panel.
+Плагин для [OpenCode v2](https://opencode.ai/v2/docs/), который направляет трафик **выбранных провайдеров** через настроенные forward-прокси (**HTTP CONNECT / SOCKS5**, с опциональной авторизацией). Провайдеры, не указанные в конфигурации, работают как раньше — напрямую.
 
-Providers that are not listed in the config are completely untouched and keep
-using their direct connection.
+Плагин полезен, когда часть провайдеров доступна только через прокси (например, локальный системный прокси или корпоративный шлюз), а остальные должны ходить напрямую.
 
-## How it works
+## Возможности
 
-The server part (`src/index.ts`) starts a local HTTP gateway on
-`127.0.0.1` (random port). For every provider assigned to a proxy it rewrites
-that provider's `settings.baseURL` to point at the gateway and forces
-`settings.transport: "http"`. The gateway resolves the original upstream URL for
-each request and forwards it through the configured proxy using `proxy-agent`
-(HTTP CONNECT or SOCKS5, including authentication), streaming both the request
-and the response body.
+- **Точечная маршрутизация**: карта «провайдер → прокси» задаётся в конфиге OpenCode.
+- **Поддержка HTTP CONNECT и SOCKS5** (с аутентификацией `username`/`password`).
+- **HTTPS через прокси** выполняется с проверкой сертификата и hostname (через `openssl s_client -verify_return_error -verify_hostname`).
+- **Без зависимости от переменных окружения** `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`: выбор прокси управляется только конфигурацией плагина.
+- **Горячая перезагрузка**: изменения конфига (`opencode.json(c)`) применяются без перезапуска OpenCode.
+- **TUI-панель и RPC**: назначать прокси можно прямо из интерфейса (`Ctrl+G` / `/proxy-setup`), изменения записываются в конфиг на диске.
+- **Стриминг**: тела запросов и ответов передаются потоково, включая chunked-ответы.
+- **Изоляция**: провайдеры вне карты маршрутов не трогаются вообще.
 
-The gateway is rebuilt whenever the config changes (including external saves and
-`/reload`), so mapping updates apply without restarting OpenCode.
+## Как это работает
 
-## Installation
+### Архитектура
 
-The plugin has no published npm package yet; load it from a local path.
-
-**Option 1 — auto-load from `.opencode/plugins/`.** Copy or symlink this package
-directory into your project's `.opencode/plugins/` directory. Plugins under
-`.opencode/plugins/` are discovered automatically:
-
-```text
-<project>/.opencode/
-  plugins/
-    provider-proxy/   <- this repo (or a symlink to it)
+```
+         OpenCode (server, Bun)
+ ┌────────────────────────────────────────────┐
+ │  provider:inception                        │
+ │    settings.baseURL = http://127.0.0.1:PORT/inception/v1
+ │    settings.transport = "http"             │
+ └───────────────┬────────────────────────────┘
+                 │  HTTP-запрос
+                 ▼
+ ┌────────────────────────────────────────────┐
+ │  Локальный gateway (порт 127.0.0.1:PORT)   │
+ │  src/gateway.ts                            │
+ │                                            │
+ │  route: /inception/v1/*  →  upstream:      │
+ │    https://api.inceptionlabs.ai/v1/*       │
+ └───────────────┬────────────────────────────┘
+                 │  CONNECT / SOCKS5 / TLS
+                 ▼
+ ┌────────────────────────────────────────────┐
+ │  Прокси (например 127.0.0.1:10808)         │
+ └───────────────┬────────────────────────────┘
+                 │  туннель
+                 ▼
+        Реальный API провайдера
 ```
 
-**Option 2 — reference it in the `plugins` array.** Add the local path to
-`plugins` in your `opencode.json(c)`:
+1. **Серверная часть** (`src/index.ts`) при старте запускает локальный HTTP-gateway на `127.0.0.1` (случайный порт).
+2. Для каждого провайдера из `options.providers` плагин переписывает его `settings.baseURL` на gateway и принудительно ставит `settings.transport: "http"`. **Путь оригинального baseURL сохраняется**: например, `https://api.inceptionlabs.ai/v1` → `http://127.0.0.1:PORT/inception/v1`.
+3. Gateway принимает запрос, снимает префикс `/inception`, восстанавливает оригинальный upstream-URL и передаёт запрос через прокси.
+4. Если провайдер не указан в настройках — его `baseURL` не меняется, трафик идёт как обычно.
 
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    "./plugins/provider-proxy"
-  ]
-}
+### Транспорт прокси
+
+Для HTTP-прокси используется рукопожатие `CONNECT` (с `Proxy-Authorization: Basic`, если заданы креды), затем обычный HTTP/1.1-обмен поверх туннеля. Для SOCKS5 выполняется полное рукопожатие (greeting → auth → connect).
+
+HTTPS-цели (upstream с `https://`) через HTTP-прокси оборачиваются в TLS при помощи `openssl s_client -proxy`: Bun не поддерживает надёжно `tls.connect({ socket })` поверх готового CONNECT-туннеля, поэтому handshake делегируется `openssl` с проверкой цепочки сертификатов и hostname. Это требует наличия `openssl` в `PATH` (см. [Требования](#требования)).
+
+> ⚠️ HTTPS через **SOCKS5**-прокси не поддерживается (openssl умеет `-proxy` только для HTTP CONNECT). Для HTTPS-апстримов используйте HTTP CONNECT-прокси.
+
+## Требования
+
+- **OpenCode v2** (проверялось на `2.2.5`, сервер работает на Bun).
+- **Node.js 20+** — для разработки и тестов (сам плагин исполняется Bun'ом внутри OpenCode).
+- **openssl** (обычно есть в системе; на Arch: `openssl` из `openssl` package).
+- Прокси: любой HTTP CONNECT или SOCKS5 forward-прокси.
+
+## Установка
+
+Плагин не опубликован в npm; ставьте его локальным путём.
+
+### Вариант A. Глобально (для всех проектов)
+
+Скопируйте (или клонируйте) репозиторий в удобное место, например:
+
+```bash
+git clone <URL-репозитория> ~/projects/opencode-provider-proxy
 ```
 
-Use an object entry to set options in the same place (see below):
-
-```jsonc
-"plugins": [
-  {
-    "package": "./plugins/provider-proxy",
-    "options": { /* ... */ }
-  }
-]
-```
-
-## Configuration
-
-Options are read from the plugin's `options` in `opencode.json(c)`:
-
-- `proxies` — an object mapping a proxy **name** to its definition. Each
-  definition takes a `url` (must start with `http://`, `https://`,
-  `socks4://`, or `socks5://`) and optionally `username`/`password` for proxy
-  authentication.
-- `providers` — an object mapping a **provider id** to the name of a proxy from
-  `proxies`. Each value may be the proxy name as a plain string (`"corp"`) or
-  an object form such as `{ "proxy": "corp" }`; both are equivalent. A provider
-  that is absent (or mapped to nothing) is not routed through a proxy.
-
-Full example:
+Затем добавьте запись в глобальный конфиг `~/.config/opencode/opencode.json(c)` (этот файл может быть JSON или JSONC; комментарии допускаются только в `opencode.jsonc`):
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "./plugins/provider-proxy",
+      "package": "/home/<user>/projects/opencode-provider-proxy",
       "options": {
         "proxies": {
-          "corp": {
-            "url": "http://corp-proxy:8080"
-          },
-          "socks": {
-            "url": "socks5://127.0.0.1:1080",
-            "username": "user",
-            "password": "secret"
-          }
+          "local-http": { "url": "http://127.0.0.1:10808" }
         },
         "providers": {
-          "anthropic": { "proxy": "corp" },
-          "openai": { "proxy": "socks" }
+          "inception": { "proxy": "local-http" },
+          "kilo": { "proxy": "local-http" }
         }
       }
     }
@@ -101,54 +99,224 @@ Full example:
 }
 ```
 
-With this config, Anthropic traffic goes through `corp` and OpenAI traffic
-through `socks`. Any other provider keeps its normal direct connection.
+Путь `package` — абсолютный путь к директории с `package.json` плагина.
 
-## TUI panel and `/proxy-setup`
+### Вариант B. Локально (для конкретного проекта)
 
-The plugin registers a TUI panel that shows every known provider and its current
-proxy (or **Direct** when unset).
+Два способа:
 
-- Open the panel with the palette entry **Provider Proxy** (`Ctrl+G`) or with
-  the slash command `/proxy-setup`.
-- Click a provider row to change its proxy through a selection dialog that lists
-  all configured proxies plus **Direct** (which clears the mapping).
-- The panel edits the canonical config file via the plugin's RPC (`updateSettings`):
-  the server writes the new mapping into `plugins[].options` and rebuilds the
-  gateway, so the change is applied **without restarting** OpenCode.
-- The panel keeps itself in sync with server-side changes by subscribing to the
-  RPC `updated` event.
-- Proxy credentials are never sent to the TUI — the panel only receives an
-  `auth` boolean per proxy, so secrets never leave the server.
+1. **Автоматическое обнаружение.** Положите плагин в `.opencode/plugins/` проекта:
 
-## Limitations
+   ```text
+   <проект>/.opencode/
+     plugins/
+       provider-proxy/   # копия репозитория или symlink
+   ```
 
-- **Discovery / OAuth / MCP traffic is not proxied.** The plugin only rewrites
-  the `baseURL` of providers listed in `providers`. Service traffic that does not
-  flow through those provider routes — MCP connectivity, OAuth token refresh,
-  provider discovery (for example Azure deployments, Copilot model sync, Ollama
-  probes) — uses the server's direct network.
-- **WebSocket transport is disabled for selected providers.** Routed providers
-  are forced to `transport: "http"`, so any WebSocket-based transport would
-  bypass the gateway and is therefore not used for them.
-- **Adding a new proxy from the panel is not supported.** The "Add proxy"
-  dialog in the panel collects a URL and optional credentials but cannot persist
-  a new proxy entry (the approved RPC contract only updates the provider→proxy
-  mapping). It shows a warning toast instead. To add a proxy, edit the config
-  file directly (see [Configuration](#configuration)); then the panel will offer
-  the new proxy for selection.
+   Плагины из `.opencode/plugins/` загружаются автоматически, без правки конфига.
 
-## Manual smoke test
+2. **Явная ссылка в конфиге проекта** (`opencode.json(c)` в корне проекта или `.opencode/opencode.json(c)`):
 
-1. Configure the plugin as in [Configuration](#configuration), with a `proxy`
-   you can observe (for example a mock CONNECT proxy) and a provider whose
-   upstream you control.
-2. Start OpenCode v2 in the project that loads the plugin.
-3. Open the panel via `/proxy-setup` (or `Ctrl+G`).
-4. In the panel, assign the test provider to your proxy, then clear it back to
-   **Direct**. After each change, confirm:
-   - `opencode.json(c)` was updated in `plugins[].options.providers`;
-   - the change applied without restarting (a fresh request from that provider
-     is routed through the proxy while mapped, and direct once cleared).
+   ```jsonc
+   {
+     "plugins": [
+       {
+         "package": "../shared/opencode-provider-proxy",
+         "options": { /* ... */ }
+       }
+     ]
+   }
+   ```
 
-See `test/README.test.md` for the full manual verification checklist.
+### Проверка установки
+
+Конфиг подхватывается автоматически (watcher). Проверьте, что плагин активен:
+
+```bash
+opencode api get /api/plugin
+```
+
+В списке должен появиться плагин `provider-proxy` со статусом `active`. В логах (`~/.local/share/opencode/log/opencode.log`) должна быть строка вида:
+
+```
+provider-proxy: active, gateway on 127.0.0.1:PORT, routes=2
+```
+
+Если статус `failed` — смотрите раздел [Устранение неполадок](#устранение-неполадок).
+
+## Настройка
+
+Все настройки лежат в `options` записи плагина в `opencode.json(c)`.
+
+### Схема options
+
+| Ключ | Тип | Описание |
+| --- | --- | --- |
+| `proxies` | объект | Карта **имя прокси → определение прокси**. |
+| `providers` | объект | Карта **id провайдера → имя прокси** из `proxies`. |
+
+Определение прокси (`proxies`):
+
+| Поле | Обязательно | Описание |
+| --- | --- | --- |
+| `url` | да | URL прокси. Схемы: `http://`, `https://`, `socks4://`, `socks5://`. |
+| `username` | нет | Логин для авторизации на прокси. |
+| `password` | нет | Пароль для авторизации на прокси. |
+
+Значение `providers.<id>` может быть:
+
+- строкой — имя прокси: `"inception": "local-http"`;
+- объектом — `{ "proxy": "local-http" }` (эквивалентно; именно эту форму записывает TUI/RPC).
+
+Провайдер, отсутствующий в `providers` (или с `null`), остаётся «напрямую».
+
+### Пример 1. HTTP CONNECT-прокси на 127.0.0.1:10808
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "/home/user/projects/opencode-provider-proxy",
+      "options": {
+        "proxies": {
+          "local-http": {
+            "url": "http://127.0.0.1:10808"
+          }
+        },
+        "providers": {
+          "inception": { "proxy": "local-http" },
+          "kilo": { "proxy": "local-http" }
+        }
+      }
+    }
+  ]
+}
+```
+
+### Пример 2. Корпоративный прокси с авторизацией
+
+```jsonc
+"proxies": {
+  "corp": {
+    "url": "http://corp-proxy.example.com:8080",
+    "username": "ivanov",
+    "password": "s3cret"
+  },
+  "corp-socks": {
+    "url": "socks5://socks.corp.example.com:1080",
+    "username": "ivanov",
+    "password": "s3cret"
+  }
+},
+"providers": {
+  "anthropic": { "proxy": "corp" },
+  "zai": { "proxy": "corp-socks" }
+}
+```
+
+### Переменные окружения
+
+В `url` (и вообще в любом значении строк) поддерживаются плейсхолдеры `${VAR}`: они заменяются на значение `process.env.VAR` в момент построения маршрута. Если переменная не задана — подставляется пустая строка и печатается предупреждение в лог.
+
+```jsonc
+"proxies": {
+  "corp": { "url": "http://${CORP_PROXY_HOST}:${CORP_PROXY_PORT}" }
+}
+```
+
+### Что происходит с провайдером
+
+Для каждого маршрутизированного провайдера плагин:
+
+- меняет `settings.baseURL` на `http://127.0.0.1:PORT/<providerId><путь из оригинального baseURL>`;
+- ставит `settings.transport: "http"`.
+
+Это видно в API (см. [Проверка](#проверка-работы)). Например, для `inception` с оригинальным `https://api.inceptionlabs.ai/v1` станет `http://127.0.0.1:34505/inception/v1`, для `kilo` `https://api.kilo.ai/api/gateway` → `http://127.0.0.1:34505/kilo/api/gateway`.
+
+### Динамическая настройка: TUI и RPC
+
+- Откройте панель **Provider Proxy**: палитра `Ctrl+G` или слеш-команда `/proxy-setup`.
+- Кнопка по провайдеру открывает диалог выбора прокси из всех `proxies` + **Direct** (снимает назначение).
+- Панель сохраняет изменения в конфиг через RPC `updateSettings` и пересобирает gateway **без перезапуска** OpenCode.
+- **Креды прокси никогда не покидают сервер**: в TUI передаётся только булев `auth` флаг, не пароль.
+
+## Проверка работы
+
+1. Убедитесь, что маршруты применились:
+
+   ```bash
+   opencode api get /api/provider
+   ```
+
+   У `inception`/`kilo` должен быть `baseURL` вида `http://127.0.0.1:PORT/...`, у остальных — оригинальный.
+
+2. Отправьте запрос к провайдеру через прокси:
+
+   ```bash
+   opencode run -m inception/mercury-3 "Скажи: OK"
+   ```
+
+   Успешный ответ модели означает, что цепочка gateway → прокси → upstream работает.
+
+3. Убедитесь, что соединение действительно идёт через прокси (опционально):
+
+   ```bash
+   ss -tnp | grep '127.0.0.1:10808'
+   ```
+
+   Во время запроса появятся ESTAB-соединения от процессов OpenCode/openssl к порту прокси.
+
+4. Проверьте логи:
+
+   ```bash
+   grep "provider-proxy:" ~/.local/share/opencode/log/opencode.log
+   ```
+
+## Устранение неполадок
+
+| Симптом | Причина / решение |
+| --- | --- |
+| Плагин `failed` в `/api/plugin` | Смотрите лог `~/.local/share/opencode/log/opencode.log`: причина обычно в ошибке импорта или в опциях. Также проверьте, что путь `package` корректен и содержит `package.json` с `exports`. |
+| `proxy_error` в ответе провайдера | Это ошибка *старой* реализации (fetch/proxy-agent). В текущей версии транспорт сырых сокетов не использует `proxy-agent`; если `proxy_error` появился — вероятно, сервер OpenCode использует устаревший код плагина (перезагрузите: сохраните конфиг или `/reload`). |
+| Ошибка `Invalid URL` | В конфиге `url` прокси или upstream-адрес составлен неверно (например, забыт слэш). Проверьте `proxies[].url` и `providers`. |
+| `404` от API провайдера | Путь не сохранился: убедитесь, что upstream `baseURL` провайдера содержит путь (например `/v1`), и что `/api/provider` показывает его в `baseURL` gateway (например `.../inception/v1`). |
+| `upstream body idle timeout` / зависание | Upstream не шлёт `Content-Length`/`Transfer-Encoding` и держит соединение открытым. Для нефреймленных тел применяется idle-таймаут 2 с; для реальных API (всегда с CL/TE) это не влияет. |
+| Ошибка TLS `SSL routines` при HTTPS через прокси | Проверьте, что установлен `openssl` и доступен в `PATH`. Убедитесь, что прокси — HTTP CONNECT (а не SOCKS), для HTTPS-апстримов. |
+| `CONNECT failed with status ...` | Прокси отверг туннель (часто требуется авторизация). Добавьте `username`/`password` в определение прокси. |
+| Изменения конфига не применяются | Откройте панель `/proxy-setup` или сохраните файл ещё раз; watcher перечитывает конфиг автоматически. При упорных проблемах — `/reload`. |
+
+### Ограничения
+
+- **Проксируется только API-трафик провайдеров** (через `baseURL`). Discovery, OAuth refresh, MCP-соединения и прочий сервисный трафик идёт напрямую.
+- **WebSocket-транспорт отключён для маршрутизированных провайдеров** (принудительно `transport: "http"`).
+- **HTTPS через SOCKS5 не поддерживается** — используйте HTTP CONNECT для HTTPS-апстримов.
+- **Добавление нового прокси из TUI-панели не поддерживается** (только выбор среди уже существующих в `proxies`). Новые прокси добавляются правкой конфига.
+- Прокси-креды не логируются и не возвращаются наружу (в TUI/API — только флаг `auth`).
+
+## Разработка
+
+```bash
+npm install          # установка зависимостей
+npm test             # vitest (53 теста)
+npm run typecheck    # tsc --noEmit
+```
+
+Структура:
+
+```
+src/
+  index.ts        # точка входа плагина: gateway, маршруты, RPC, подписка на config.updated
+  gateway.ts      # сырой транспорт: CONNECT/SOCKS5, TLS через openssl, chunked-декодер
+  apply.ts        # переписывание settings.baseURL / transport провайдеров
+  config.ts       # нормализация и валидация options
+  upstream.ts     # построение upstream-URL из пути запроса
+  rpc.ts          # RPC-контракт (getSettings / updateSettings)
+  tui.tsx         # TUI-панель (Ctrl+G, /proxy-setup)
+  jsonc-config.ts # чтение/запись options в opencode.json(c)
+test/             # vitest-тесты (включая интеграционные для gateway)
+```
+
+## Лицензия
+
+GNU General Public License v3.0 or later (GPL-3.0-or-later). Полный текст — в файле [LICENSE](LICENSE).
